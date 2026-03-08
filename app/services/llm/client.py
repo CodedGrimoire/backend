@@ -3,7 +3,6 @@ import os
 from typing import Any, Dict, List
 
 import httpx
-from groq import Groq
 
 from app.services.sql.safety import ensure_limit
 from app.services.datasets.schema_context import build_schema_context
@@ -125,13 +124,10 @@ Return ONLY the SQL query."""
 
 llm_client = LLMClient()
 
-# Simple Groq-backed SQL generator for NL questions
-groq_client = Groq(api_key=settings.groq_api_key) if settings.groq_api_key else None
-
 
 async def generate_sql(schema_context: str, question: str) -> str:
     print("LLM generating SQL for:", question)
-    if not groq_client:
+    if not settings.groq_api_key:
         raise RuntimeError("Groq client not configured")
     prompt = f"""You are an expert data analyst writing PostgreSQL queries.
 
@@ -184,19 +180,14 @@ Do not include explanations.
 Do not include markdown.
 Do not include multiple SQL statements.
 Do NOT include markdown code fences or ```sql tags. Output must be a single executable SQL statement."""
-    response = groq_client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    sql = response.choices[0].message.content.strip()
-    return sql
+    sql = await llm_client._call_groq(prompt, expect_json=False)
+    return sql.strip() if sql else ""
 
 
 async def generate_answer(question: str, sql: str, rows) -> str:
     """Generate a concise NL answer using ONLY executed query results."""
     print("LLM generating NL answer for:", question)
-    if not groq_client:
+    if not settings.groq_api_key:
         return ""
     prompt = f"""You are a data assistant.
 
@@ -216,17 +207,13 @@ Rules:
 - If the result has exactly one value, respond with that value in a direct sentence.
 - If there are multiple rows, summarize the findings briefly.
 - Never invent data or run new queries."""
-    resp = groq_client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    return resp.choices[0].message.content.strip()
+    text = await llm_client._call_groq(prompt, expect_json=False)
+    return text.strip() if text else ""
 
 
 async def repair_sql(sql: str, error: str) -> str | None:
     """Ask the LLM to repair a failed SQL query."""
-    if not groq_client:
+    if not settings.groq_api_key:
         return None
     prompt = f"""The following SQL query failed to execute. Fix the SQL and return ONLY the corrected query.
 
@@ -237,18 +224,15 @@ Error message:
 {error}
 
 Return only valid PostgreSQL SQL. Do not include explanations or markdown."""
-    resp = groq_client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    fixed = resp.choices[0].message.content.strip()
+    fixed = await llm_client._call_groq(prompt, expect_json=False)
+    if fixed:
+        fixed = fixed.strip()
     return fixed if fixed and is_safe_sql(fixed) else None
 
 
 async def generate_suggestions(schema_context: str, n: int = 5) -> list[str]:
     """Ask the LLM for NL question suggestions based on schema."""
-    if not groq_client:
+    if not settings.groq_api_key:
         return []
     prompt = f"""You are a data analyst.
 
@@ -266,13 +250,9 @@ Return {n} short questions as a JSON array of strings.
 Schema:
 {schema_context}
 """
-    resp = groq_client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        response_format={"type": "json_object"}
-    )
-    text = resp.choices[0].message.content.strip()
+    text = await llm_client._call_groq(prompt, expect_json=True)
+    if text:
+        text = text.strip()
     try:
         parsed = json.loads(text)
         if isinstance(parsed, list):
@@ -301,7 +281,7 @@ def _normalize_questions(raw: list) -> list[str]:
 
 async def generate_synonyms(schema_brief: str) -> dict[str, list[str]]:
     """Return synonyms per column (LLM optional)."""
-    if not groq_client:
+    if not settings.groq_api_key:
         return {}
     prompt = f"""You are analyzing a dataset schema.
 
@@ -315,13 +295,9 @@ Do NOT change column names or types. Do not add new columns.
 Schema:
 {schema_brief}
 """
-    resp = groq_client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-    text = resp.choices[0].message.content.strip()
+    text = await llm_client._call_groq(prompt, expect_json=True)
+    if text:
+        text = text.strip()
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -333,7 +309,7 @@ Schema:
 
 async def generate_intent(schema_context: str, question: str, metadata: dict | None = None) -> dict | None:
     """LLM-based intent resolver returning structured JSON."""
-    if not groq_client:
+    if not settings.groq_api_key:
         return None
     meta_str = ""
     if metadata:
@@ -364,13 +340,9 @@ Question:
 {question}
 
 Return JSON only."""
-    resp = groq_client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-    text = resp.choices[0].message.content.strip()
+    text = await llm_client._call_groq(prompt, expect_json=True)
+    if text:
+        text = text.strip()
     try:
         data = json.loads(text)
         return data if isinstance(data, dict) else None
