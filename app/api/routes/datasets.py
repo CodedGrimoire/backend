@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Query
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 import pandas as pd
+import sqlglot
 
 from app.api.deps import assert_dataset_owner, get_current_user
 from app.core.db.session import get_session
@@ -37,11 +38,12 @@ from app.services.dashboards.service import rebuild_dashboard_stub, fetch_dashbo
 from app.services.datasets.service import get_schema_metadata
 from app.services.datasets.schema_context import build_schema_context, build_full_schema_context
 from app.services.datasets.profiling import profile_dataset
-from app.services.llm.client import llm_client, generate_sql, generate_answer, repair_sql
+from app.services.llm.client import llm_client, generate_sql, generate_answer, repair_sql, generate_suggestions
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 _query_cache: Dict[str, Dict[str, Any]] = {}
+_suggestion_cache: Dict[str, list[str]] = {}
 
 
 def _normalize_question(question: str) -> str:
@@ -61,6 +63,19 @@ def _classify_result(sql: str, rows: list[dict[str, Any]], columns: list[dict[st
     if has_order:
         return "ranking"
     return "table"
+
+
+def _projection_aliases(sql: str) -> set[str]:
+    """Return lower-cased aliases defined in SELECT list (used to allow ORDER BY alias)."""
+    try:
+        parsed = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        return set()
+    aliases: set[str] = set()
+    for expr in parsed.expressions or []:
+        if isinstance(expr, sqlglot.exp.Alias):
+            aliases.add(expr.alias.lower())
+    return aliases
 
 
 async def _schema_fingerprint(session: AsyncSession) -> tuple[str, set[str]]:
@@ -252,6 +267,37 @@ async def get_dataset(
     return DatasetDetail(id=str(ds.id), name=ds.name, table=ds.table_name, status=ds.status, row_count=ds.row_count)
 
 
+@router.get("/{dataset_id}/suggestions")
+async def dataset_suggestions(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    ds = await assert_dataset_owner(dataset_id, current_user.firebase_uid, session)
+    if dataset_id in _suggestion_cache:
+        return {"suggestions": _suggestion_cache[dataset_id]}
+    schema_ctx = await build_full_schema_context(session)
+    questions = await generate_suggestions(schema_ctx)
+    _suggestion_cache[dataset_id] = questions
+    await log_action(session, ds.id, current_user.id, "suggestions", {"count": len(questions)})
+    return {"suggestions": questions}
+
+
+@router.get("/{dataset_id}/preview")
+async def preview_dataset(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    ds = await assert_dataset_owner(dataset_id, current_user.firebase_uid, session)
+    table_name = ds.table_name
+    stmt = text(f'SELECT * FROM "{table_name}" LIMIT 100')
+    result = await session.execute(stmt)
+    columns = _build_column_metadata(result)
+    rows = [dict(r) for r in result.mappings().all()]
+    return {"columns": columns, "rows": rows}
+
+
 @router.post("/{dataset_id}/query", response_model=QueryResponse)
 async def query_dataset(
     dataset_id: str,
@@ -299,10 +345,13 @@ async def query_dataset(
 
     # validate columns against live schema
     cols_in_sql = extract_columns(sql_text)
+    select_aliases = _projection_aliases(sql_text)
     for col in cols_in_sql:
         normalized = normalize_column(col)
         if normalized == "*" or not normalized:
             continue
+        if normalized in select_aliases:
+            continue  # allow ORDER BY aliases, etc.
         if normalized not in allowed_cols:
             raise HTTPException(status_code=400, detail=f"Invalid column referenced: {normalized} | SQL: {sql_text}")
     print(f"LLM question: {body.question}")
@@ -340,7 +389,7 @@ async def query_dataset(
 
     if result.returns_rows:
         columns = _build_column_metadata(result)
-        rows = [dict(r._mapping) for r in result.mappings().all()]
+        rows = [dict(r) for r in result.mappings().all()]
         row_count = len(rows)
     else:
         row_count = result.rowcount or 0

@@ -33,7 +33,16 @@ def is_safe_sql(sql: str) -> bool:
 
     parsed = parsed_list[0]
 
-    if parsed.find(exp.Drop) or parsed.find(exp.Truncate) or parsed.find(exp.Delete) or parsed.find(exp.Alter):
+    # block destructive operations via AST if supported, otherwise fallback to string detection
+    destructive_nodes = []
+    for name in ["Drop", "Truncate", "TruncateTable", "Delete", "Alter"]:
+        node = getattr(exp, name, None)
+        if node:
+            destructive_nodes.append(node)
+    for node in destructive_nodes:
+        if parsed.find(node):
+            return False
+    if any(word in lowered for word in ["drop ", "truncate ", "delete ", "alter "]):
         return False
 
     # allow SELECT, INSERT, UPDATE (and CTEs which wrap SELECT)

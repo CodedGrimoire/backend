@@ -239,3 +239,52 @@ Return only valid PostgreSQL SQL. Do not include explanations or markdown."""
     )
     fixed = resp.choices[0].message.content.strip()
     return fixed if fixed and is_safe_sql(fixed) else None
+
+
+async def generate_suggestions(schema_context: str) -> list[str]:
+    """Ask the LLM for NL question suggestions based on schema."""
+    if not groq_client:
+        return []
+    prompt = f"""You are a data analyst.
+
+Given the following database schema, generate 5 useful, diverse natural language questions a user might ask.
+The questions should be answerable with SQL (joins allowed) and cover aggregation, ranking, filtering.
+
+Return ONLY a JSON array of strings.
+
+Schema:
+{schema_context}
+"""
+    resp = groq_client.chat.completions.create(
+        model=settings.groq_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        response_format={"type": "json_object"}
+    )
+    text = resp.choices[0].message.content.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return _normalize_questions(parsed)
+        if isinstance(parsed, dict):
+            # allow {"questions":[...]}
+            for v in parsed.values():
+                if isinstance(v, list):
+                    return _normalize_questions(v)
+    except Exception:
+        return []
+    return []
+
+
+def _normalize_questions(raw: list) -> list[str]:
+    cleaned = []
+    for q in raw:
+        q_str = str(q).strip()
+        if not q_str:
+            continue
+        words = q_str.split()
+        q_str = " ".join(words[:8])  # max 8 words
+        cleaned.append(q_str)
+        if len(cleaned) >= 4:
+            break
+    return cleaned
