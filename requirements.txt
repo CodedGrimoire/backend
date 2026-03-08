@@ -11,3 +11,4 @@ httpx==0.28.1
 firebase-admin==6.9.0
 sqlglot==29.0.1
 gunicorn==22.0.0
+python-multipart==0.0.9
