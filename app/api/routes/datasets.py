@@ -298,6 +298,67 @@ async def preview_dataset(
     return {"columns": columns, "rows": rows}
 
 
+@router.get("/{dataset_id}/rows")
+async def list_dataset_rows(
+    dataset_id: str,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    sort_by: str | None = Query(default=None),
+    sort_order: str | None = Query(default="asc"),
+    filter_column: str | None = Query(default=None),
+    filter_value: str | None = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    ds = await assert_dataset_owner(dataset_id, current_user.firebase_uid, session)
+    table_name = ds.table_name
+    offset = (page - 1) * limit
+
+    # allowed columns to avoid injection
+    col_meta_stmt = text(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = :table"
+    )
+    col_res = await session.execute(col_meta_stmt, {"table": table_name})
+    col_rows = col_res.fetchall()
+    allowed_cols = {r[0] for r in col_rows}
+    col_types = {r[0]: r[1] for r in col_rows}
+
+    params: Dict[str, Any] = {"limit": limit, "offset": offset}
+    where_clause = ""
+    if filter_column and filter_value and filter_column in allowed_cols:
+        col_type = col_types.get(filter_column, "")
+        cast_prefix = ""
+        # if numeric, cast to text for ILIKE
+        if any(k in col_type.lower() for k in ["int", "numeric", "decimal", "double", "real", "float"]):
+            cast_prefix = "CAST"
+            where_clause = f' WHERE CAST("{filter_column}" AS TEXT) ILIKE :fval'
+        else:
+            where_clause = f' WHERE "{filter_column}" ILIKE :fval'
+        params["fval"] = f"%{filter_value}%"
+
+    order_clause = ""
+    if sort_by and sort_by in allowed_cols:
+        direction = "DESC" if (sort_order or "").lower() == "desc" else "ASC"
+        order_clause = f' ORDER BY "{sort_by}" {direction}'
+
+    count_stmt = text(f'SELECT COUNT(*) FROM "{table_name}"{where_clause}')
+    count_res = await session.execute(count_stmt, params if where_clause else {})
+    total_rows = count_res.scalar() or 0
+
+    data_stmt = text(f'SELECT * FROM "{table_name}"{where_clause}{order_clause} LIMIT :limit OFFSET :offset')
+    result = await session.execute(data_stmt, params)
+    columns = _build_column_metadata(result)
+    rows = [dict(r) for r in result.mappings().all()]
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "page": page,
+        "limit": limit,
+        "total_rows": total_rows,
+    }
+
+
 @router.post("/{dataset_id}/query", response_model=QueryResponse)
 async def query_dataset(
     dataset_id: str,
