@@ -45,13 +45,16 @@ Execute SQL or NL question against the dataset (joins allowed across public sche
 
 **Behavior**
 - NL question → LLM generates SQL with full schema context.
-- SQL safety: blocks DROP/DELETE/TRUNCATE/ALTER, single statement, validates columns against `information_schema`.
+- SQL safety: blocks DROP/DELETE/TRUNCATE/ALTER/UPDATE/INSERT, single statement, validates columns and tables against live schema; strips hallucinated joins if columns belong to one table; regenerates once if invalid.
 - Auto LIMIT unless aggregation.
 - On execution error, one repair attempt via LLM with error context.
 - Results classified as `scalar | table | ranking | aggregation`.
 - Column metadata taken from the DB cursor (actual result set).
 - Result answer generated *after* execution using rows only.
 - In-memory cache key: `normalized_question + schema_hash`.
+- String filters are case-insensitive and flexible (`ILIKE '%value%'`).
+- Dataset metadata (metrics/dimensions/time columns/indexed columns) is injected into LLM context for better SQL.
+- Intent layer: NL question → structured intent (metric/aggregation/group/filter/order/limit) → SQL builder → validation.
 
 **Response (standardized)**
 ```json
@@ -72,6 +75,13 @@ Execute SQL or NL question against the dataset (joins allowed across public sche
 - `table`: default multi-row/column result
 - `ranking`: ordered result (`ORDER BY` present)
 - `aggregation`: grouped data (`GROUP BY` present)
+
+### GET `/datasets/{dataset_id}/rows`
+Paginated dataset browser with sorting and filtering.
+
+Query params: `page`, `limit`, `sort_by`, `sort_order`, `filter_column`, `filter_value`
+
+Returns: `columns`, `rows`, `page`, `limit`, `total_rows`
 
 ## Dashboard
 

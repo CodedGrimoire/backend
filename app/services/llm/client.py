@@ -135,7 +135,7 @@ async def generate_sql(schema_context: str, question: str) -> str:
         raise RuntimeError("Groq client not configured")
     prompt = f"""You are an expert data analyst writing PostgreSQL queries.
 
-You are working with a spreadsheet-style dataset stored in PostgreSQL.
+You are working with a single-table spreadsheet-style dataset stored in PostgreSQL.
 
 Database schema:
 {schema_context}
@@ -145,17 +145,13 @@ User request:
 
 Instructions:
 1. Generate a valid PostgreSQL query that answers the user's request.
-2. Only use columns that exist in the dataset schema.
-3. Use the appropriate tables from the schema when answering the query.
-4. Never assume columns that do not exist.
+2. Only use tables and columns that exist in the provided schema.
+3. Joins are allowed only if a relationship is listed in the schema context; otherwise avoid joins.
+4. Never assume columns or tables that do not exist; only use the provided columns.
 5. Prefer explicit column selection instead of SELECT * unless the user explicitly requests all data.
-6. You may query multiple tables and use JOIN when necessary.
-7. Use table aliases when joining.
-8. Infer relationships using common foreign keys such as:
-   orders.customer_id → customers.id
-   order_items.order_id → orders.id
-   order_items.product_id → products.id
-   payments.order_id → orders.id
+6. Only use tables that appear in the provided schema. Do NOT reference other tables or CTEs.
+7. If ranking is requested (top/best/highest), use ORDER BY with aggregates and LIMIT.
+8. When filtering text columns, make comparisons case-insensitive (use ILIKE or LOWER()).
 
 Safety rules:
 * NEVER generate DROP statements.
@@ -168,6 +164,15 @@ Query quality rules:
 * Use GROUP BY when aggregating by category.
 * Use ORDER BY when sorting results.
 * Use LIMIT when returning ranked or large result sets.
+ * For text filters, make comparisons case-insensitive using ILIKE or LOWER(...).
+ * When matching text from the question, use flexible matching (ILIKE '%value%') unless the user asks for exact matches.
+ * If the question uses "who is", "which", or "top", assume a ranking intent and use ORDER BY with aggregates where appropriate.
+
+Examples:
+- "How many laptops were sold in total?" ->
+  SELECT SUM(units_sold) AS total_units FROM <table_name> WHERE LOWER(product) = LOWER('laptop');
+- "What is the total revenue in Asia?" ->
+  SELECT SUM(revenue) AS total_revenue FROM <table_name> WHERE LOWER(region) = LOWER('asia');
 
 Edge case handling:
 If the question cannot be answered using the available columns in the schema, return:
@@ -241,16 +246,22 @@ Return only valid PostgreSQL SQL. Do not include explanations or markdown."""
     return fixed if fixed and is_safe_sql(fixed) else None
 
 
-async def generate_suggestions(schema_context: str) -> list[str]:
+async def generate_suggestions(schema_context: str, n: int = 5) -> list[str]:
     """Ask the LLM for NL question suggestions based on schema."""
     if not groq_client:
         return []
     prompt = f"""You are a data analyst.
 
-Given the following database schema, generate 5 useful, diverse natural language questions a user might ask.
-The questions should be answerable with SQL (joins allowed) and cover aggregation, ranking, filtering.
+Given the schema of a dataset, generate useful analytical questions a user might ask.
 
-Return ONLY a JSON array of strings.
+Rules:
+- Do NOT mention table names.
+- Do NOT mention dataset IDs.
+- Do NOT include internal identifiers.
+- Questions should sound natural to a non-technical user.
+- Questions should refer only to column meanings.
+
+Return {n} short questions as a JSON array of strings.
 
 Schema:
 {schema_context}
@@ -283,8 +294,85 @@ def _normalize_questions(raw: list) -> list[str]:
         if not q_str:
             continue
         words = q_str.split()
-        q_str = " ".join(words[:8])  # max 8 words
+        q_str = " ".join(words[:12])  # keep short
         cleaned.append(q_str)
-        if len(cleaned) >= 4:
-            break
     return cleaned
+
+
+async def generate_synonyms(schema_brief: str) -> dict[str, list[str]]:
+    """Return synonyms per column (LLM optional)."""
+    if not groq_client:
+        return {}
+    prompt = f"""You are analyzing a dataset schema.
+
+For each column, provide:
+1) a short description
+2) 2-3 synonyms users might say when asking questions.
+
+Return JSON object: {{ "column": {{"description": "...", "synonyms": ["...", "..."]}}, ... }}.
+Do NOT change column names or types. Do not add new columns.
+
+Schema:
+{schema_brief}
+"""
+    resp = groq_client.chat.completions.create(
+        model=settings.groq_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    text = resp.choices[0].message.content.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+    return {}
+
+
+async def generate_intent(schema_context: str, question: str, metadata: dict | None = None) -> dict | None:
+    """LLM-based intent resolver returning structured JSON."""
+    if not groq_client:
+        return None
+    meta_str = ""
+    if metadata:
+        meta_str = (
+            f"\n\nMetadata:\n"
+            f"metrics: {', '.join(metadata.get('metrics', []))}\n"
+            f"dimensions: {', '.join(metadata.get('dimensions', []))}\n"
+            f"time_columns: {', '.join(metadata.get('time_columns', []))}\n"
+            f"synonyms: {metadata.get('synonyms', {})}\n"
+            f"filter_values: {metadata.get('filter_values', {})}\n"
+        )
+    prompt = f"""You are an analytics intent resolver.
+Given a dataset schema and a user question, produce a JSON intent with fields:
+metric, aggregation (SUM|AVG|COUNT|MIN|MAX), group_by, filters (list of {{column, operator, value}}),
+order_by (ASC|DESC), limit (integer).
+
+Rules:
+- Only use columns from the schema.
+- Prefer metadata synonyms to map user terms to columns.
+- For ranking words (top, best, highest), set order_by=DESC and include a limit if implied (default 10).
+- Make filters case-insensitive by design.
+- Keep strings literal; do NOT invent tables.
+
+Schema:
+{schema_context}{meta_str}
+
+Question:
+{question}
+
+Return JSON only."""
+    resp = groq_client.chat.completions.create(
+        model=settings.groq_model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    text = resp.choices[0].message.content.strip()
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None

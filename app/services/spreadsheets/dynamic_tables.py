@@ -62,10 +62,10 @@ def normalize_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     return df.rename(columns=renamed), mapping
 
 
-async def create_table_from_df(session: AsyncSession, dataset_id: str, df: pd.DataFrame) -> str:
+async def create_table_from_df(session: AsyncSession, dataset_id: str, df: pd.DataFrame, table_name: str | None = None) -> str:
     df_norm, mapping = normalize_columns(df)
     columns = infer_types(df_norm)
-    table_name = await generate_unique_table_name(session, dataset_id)
+    table_name = table_name or await generate_unique_table_name(session, dataset_id)
     cols_sql = ", ".join([f'"{c}" {t}' for c, t in columns.items()])
     create_sql = f'CREATE TABLE "{table_name}" (id BIGSERIAL PRIMARY KEY, {cols_sql});'
     await session.execute(text(create_sql))

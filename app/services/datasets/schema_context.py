@@ -40,3 +40,41 @@ async def build_full_schema_context(session: AsyncSession) -> str:
         cols_join = ", ".join(cols)
         lines.append(f"{table}({cols_join})")
     return "\n".join(lines)
+
+
+async def build_single_table_context(session: AsyncSession, dataset_id: uuid.UUID) -> str:
+    ds_res = await session.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = ds_res.scalar_one_or_none()
+    if not dataset:
+        return ""
+    cols_res = await session.execute(
+        select(DatasetColumn).where(DatasetColumn.dataset_id == dataset_id).order_by(DatasetColumn.order)
+    )
+    cols = [c.name for c in cols_res.scalars().all()]
+    return f"TABLE: {dataset.table_name}\nCOLUMNS: {', '.join(cols)}"
+
+
+async def build_multi_table_context(session: AsyncSession, dataset_id: uuid.UUID, tables: list[str]) -> str:
+    if not tables:
+        return ""
+    res = await session.execute(
+        text(
+            "SELECT table_name, column_name "
+            "FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = ANY(:tables) "
+            "ORDER BY table_name, ordinal_position"
+        ),
+        {"tables": tables},
+    )
+    lines = ["Tables:"]
+    current = None
+    cols: list[str] = []
+    for tbl, col in res.fetchall():
+        if current and tbl != current:
+            lines.append(f"- {current} ({', '.join(cols)})")
+            cols = []
+        current = tbl
+        cols.append(col)
+    if current:
+        lines.append(f"- {current} ({', '.join(cols)})")
+    return "\n".join(lines)

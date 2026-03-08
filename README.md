@@ -11,6 +11,12 @@ FastAPI service that turns natural language questions into safe SQL, runs them o
 - In-memory query cache keyed by normalized question + live schema hash.
 - Standardized response shape for frontend:
   `{type, sql, rows, columns, row_count, answer}`.
+- Hybrid suggestions (rule-based + LLM, deduped, capped at 3, never leaks table/IDs).
+- Case-insensitive, flexible text filters; string comparisons auto-ILIKE; validation blocks unknown tables/columns.
+- Schema-aware SQL guardrail: validates tables/columns, blocks unsafe ops, strips hallucinated joins, regenerates once if invalid.
+- Dataset ingestion optimization: column profiling, role detection (metrics/dimensions/time/identifiers), automatic indexes on dimensions/time; semantic layer (metric aggregations, filter values, synonyms) cached for LLM context.
+- Paginated dataset browser with sorting/filtering; rows endpoint supports sort/filter/limit/offset.
+- Intent-based NL→SQL: questions -> structured intent (metric/aggregation/group/filter/order/limit) -> SQL builder -> validated execution, reducing hallucinations.
 
 ## Prerequisites
 - Python 3.12+
