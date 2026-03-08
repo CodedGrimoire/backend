@@ -246,7 +246,8 @@ async def _get_metadata(session: AsyncSession, dataset_id: str, table_name: str)
             cols = [c["name"] for c in table_cols.get(t, [])]
             if not cols:
                 continue
-            sample_stmt = text(f'SELECT {", ".join([f"""\"{c}\"""" for c in cols])} FROM "{t}" LIMIT 500')
+            quoted_cols = ", ".join([f'"{c}"' for c in cols])
+            sample_stmt = text(f'SELECT {quoted_cols} FROM "{t}" LIMIT 500')
             res = await session.execute(sample_stmt)
             dfs[t] = pd.DataFrame(res.fetchall(), columns=cols)
         if dfs:
