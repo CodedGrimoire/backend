@@ -1,0 +1,35 @@
+# Virtualenv
+.venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+
+# Environment & secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Migrations cache
+alembic/versions/__pycache__/
+
+# Coverage / test
+.pytest_cache/
+.coverage
+coverage.xml
+
+# Build
+dist/
+build/
+
+# Local data
+*.db
+*.csv
