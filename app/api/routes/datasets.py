@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 import uuid
 from typing import Any, Dict
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Query
@@ -53,6 +54,23 @@ logger = logging.getLogger(__name__)
 _query_cache: Dict[str, Dict[str, Any]] = {}
 _suggestion_cache: Dict[str, list[str]] = {}
 _metadata_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _unique_dataset_name(base_name: str, existing: set[str]) -> str:
+    """Return a dataset name that does not collide for the user.
+
+    Keeps the original extension and appends ``(n)`` like macOS if needed.
+    """
+    if base_name not in existing:
+        return base_name
+
+    stem, ext = os.path.splitext(base_name)
+    counter = 1
+    while True:
+        candidate = f"{stem} ({counter}){ext}"
+        if candidate not in existing:
+            return candidate
+        counter += 1
 
 
 def _jaccard_similarity(a: set[str], b: set[str]) -> float:
@@ -416,14 +434,19 @@ async def upload_dataset(
     merged_sheets = _merge_similar_sheets(sheets)
 
     total_rows = sum(len(df) for _, df in merged_sheets)
-    dataset = Dataset(owner_id=None, name=file.filename, table_name="pending", row_count=total_rows, status="processing")
-    # attach owner
+
+    # attach owner and pick a unique name for this user (avoid IntegrityError on duplicate filename)
     user_stmt = select(User).where(User.firebase_uid == current_user.firebase_uid)
     res = await session.execute(user_stmt)
     user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
-    dataset.owner_id = user.id
+
+    existing_names_res = await session.execute(select(Dataset.name).where(Dataset.owner_id == user.id))
+    existing_names = set(existing_names_res.scalars().all())
+    dataset_name = _unique_dataset_name(file.filename, existing_names)
+
+    dataset = Dataset(owner_id=user.id, name=dataset_name, table_name="pending", row_count=total_rows, status="processing")
 
     session.add(dataset)
     await session.flush()
