@@ -95,10 +95,12 @@ def _profile_df_columns(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
 def _merge_similar_sheets(sheets: dict[str, pd.DataFrame]) -> list[tuple[str, pd.DataFrame]]:
     merged: list[tuple[str, pd.DataFrame]] = []
     for name, df in sheets.items():
-        cols = {c.lower() for c in df.columns}
+        # Column headers coming from spreadsheets can occasionally be non-strings (e.g. booleans/None).
+        # Normalize to lowercase strings to avoid AttributeError when calling .lower().
+        cols = {str(c).lower() for c in df.columns}
         placed = False
         for idx, (mname, mdf) in enumerate(merged):
-            sim = _jaccard_similarity(cols, {c.lower() for c in mdf.columns})
+            sim = _jaccard_similarity(cols, {str(c).lower() for c in mdf.columns})
             if sim >= 0.9:
                 # align columns union
                 all_cols = list({*mdf.columns, *df.columns})
