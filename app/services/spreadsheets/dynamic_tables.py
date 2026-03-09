@@ -66,8 +66,10 @@ async def create_table_from_df(session: AsyncSession, dataset_id: str, df: pd.Da
     df_norm, mapping = normalize_columns(df)
     columns = infer_types(df_norm)
     table_name = table_name or await generate_unique_table_name(session, dataset_id)
+    # avoid duplicate "id" when source data already has an id column
+    pk_name = "id" if "id" not in columns else "pk_id"
     cols_sql = ", ".join([f'"{c}" {t}' for c, t in columns.items()])
-    create_sql = f'CREATE TABLE "{table_name}" (id BIGSERIAL PRIMARY KEY, {cols_sql});'
+    create_sql = f'CREATE TABLE "{table_name}" ({pk_name} BIGSERIAL PRIMARY KEY, {cols_sql});'
     await session.execute(text(create_sql))
     await bulk_insert(session, table_name, df_norm)
     # restore original column names on the df for upstream mapping use

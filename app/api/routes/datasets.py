@@ -581,11 +581,15 @@ async def delete_dataset(
     tables = await _dataset_tables(session, dataset_id)
     for t in tables:
         await session.execute(text(f'DROP TABLE IF EXISTS "{t}" CASCADE'))
+    # log before removing the dataset row to avoid FK issues; ignore if dataset vanished
+    try:
+        await log_action(session, ds.id, current_user.id, "delete", {"tables_dropped": tables})
+    except Exception:
+        pass
     await session.execute(delete(Dataset).where(Dataset.id == ds.id))
     _suggestion_cache.pop(dataset_id, None)
     _metadata_cache.pop(dataset_id, None)
     await session.commit()
-    await log_action(session, ds.id, current_user.id, "delete", {"tables_dropped": tables})
     return
 
 
