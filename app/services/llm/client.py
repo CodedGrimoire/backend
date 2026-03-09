@@ -15,7 +15,8 @@ class LLMClient:
         self.provider = os.getenv("LLM_PROVIDER", "mock").lower()
         self.groq_key = os.getenv("GROQ_API_KEY")
         self.gemini_key = os.getenv("GEMINI_API_KEY")
-        self.groq_model = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+        # prefer configured value; do not override with hardcoded defaults
+        self.groq_model = settings.groq_model
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
     def _schema_to_str(self, schema: Dict[str, Any]) -> str:
@@ -88,8 +89,11 @@ Return ONLY the SQL query."""
         return None
 
     async def _call_groq(self, prompt: str, expect_json: bool) -> str | None:
+        api_key = self.groq_key or settings.groq_api_key
+        if not api_key:
+            return None
         headers = {
-            "Authorization": f"Bearer {self.groq_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         body = {
@@ -98,8 +102,9 @@ Return ONLY the SQL query."""
             "temperature": 0,
         }
         async with httpx.AsyncClient(timeout=30, base_url="https://api.groq.com") as client:
-            resp = await client.post("/openai/v1/chat/completions", json=body)
+            resp = await client.post("/openai/v1/chat/completions", json=body, headers=headers)
             if resp.status_code != 200:
+                print(f"GROQ call failed status={resp.status_code} body={resp.text[:200]}")
                 return None
             data = resp.json()
             return data["choices"][0]["message"]["content"]
@@ -253,8 +258,22 @@ Schema:
     text = await llm_client._call_groq(prompt, expect_json=True)
     if text:
         text = text.strip()
+    if not text:
+        print("LLM suggestions: empty response from Groq")
+        return []
     try:
-        parsed = json.loads(text)
+        cleaned = text
+        # handle code fences the model might return
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            cleaned = cleaned.replace("json", "", 1).strip()
+        # fallback: extract JSON array substring
+        if not cleaned.startswith("["):
+            start = cleaned.find("[")
+            end = cleaned.rfind("]")
+            if start != -1 and end != -1:
+                cleaned = cleaned[start : end + 1]
+        parsed = json.loads(cleaned)
         if isinstance(parsed, list):
             return _normalize_questions(parsed)
         if isinstance(parsed, dict):
@@ -262,7 +281,8 @@ Schema:
             for v in parsed.values():
                 if isinstance(v, list):
                     return _normalize_questions(v)
-    except Exception:
+    except Exception as exc:
+        print(f"LLM suggestions: failed to parse JSON ({exc}); raw={text[:200]}")
         return []
     return []
 

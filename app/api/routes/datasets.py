@@ -3,7 +3,7 @@ import logging
 import uuid
 from typing import Any, Dict
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Query
-from sqlalchemy import select, text
+from sqlalchemy import select, text, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 import pandas as pd
 import sqlglot
@@ -569,6 +569,24 @@ async def list_datasets(
     result = await session.execute(stmt)
     datasets = result.scalars().all()
     return [DatasetOut(id=str(ds.id), name=ds.name, status=ds.status) for ds in datasets]
+
+
+@router.delete("/{dataset_id}", status_code=204)
+async def delete_dataset(
+    dataset_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    ds = await assert_dataset_owner(dataset_id, current_user.firebase_uid, session)
+    tables = await _dataset_tables(session, dataset_id)
+    for t in tables:
+        await session.execute(text(f'DROP TABLE IF EXISTS "{t}" CASCADE'))
+    await session.execute(delete(Dataset).where(Dataset.id == ds.id))
+    _suggestion_cache.pop(dataset_id, None)
+    _metadata_cache.pop(dataset_id, None)
+    await session.commit()
+    await log_action(session, ds.id, current_user.id, "delete", {"tables_dropped": tables})
+    return
 
 
 @router.get("/{dataset_id}", response_model=DatasetDetail)

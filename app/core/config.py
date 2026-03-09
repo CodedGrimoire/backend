@@ -6,7 +6,7 @@ from sqlalchemy.engine.url import make_url
 class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=("backend/.env", ".env"),
         case_sensitive=False,
         extra="allow"
     )
@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     # ---- LLM Configuration (Groq only) ----
     groq_api_key: str = Field(..., alias="GROQ_API_KEY")
-    groq_model: str = Field("llama-3.1-70b-versatile", alias="GROQ_MODEL")
+    groq_model: str = Field("llama-3.3-70b-versatile", alias="GROQ_MODEL")
 
     # provider is now fixed
     llm_provider: str = "groq"
