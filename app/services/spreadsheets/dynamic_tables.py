@@ -10,20 +10,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.utils.identifiers import sanitize_identifier, short_hash
 
 
+def infer_sql_type(series: pd.Series) -> str:
+    series = series.dropna()
+    if series.empty:
+        return "TEXT"
+    str_vals = series.astype(str)
+    total = len(str_vals)
+
+    int_matches = str_vals.str.match(r"^-?\d+$", na=False).sum()
+    if int_matches / total >= 0.95:
+        return "INTEGER"
+
+    float_matches = str_vals.str.match(r"^-?\d+(\\.\\d+)?$", na=False).sum()
+    if float_matches / total >= 0.95:
+        return "DOUBLE PRECISION"
+
+    bool_matches = str_vals.str.lower().isin({"true", "false", "yes", "no", "0", "1"}).sum()
+    if bool_matches / total >= 0.8:
+        return "BOOLEAN"
+
+    dt_parsed = pd.to_datetime(series, errors="coerce")
+    dt_ratio = dt_parsed.notna().sum() / total
+    if dt_ratio >= 0.8:
+        return "TIMESTAMP"
+
+    return "TEXT"
+
+
 def infer_types(df: pd.DataFrame) -> dict[str, str]:
     mapping: dict[str, str] = {}
-    for col, dtype in df.dtypes.items():
+    for col in df.columns:
         safe_col = sanitize_identifier(col)
-        if pd.api.types.is_integer_dtype(dtype):
-            mapping[safe_col] = "BIGINT"
-        elif pd.api.types.is_float_dtype(dtype):
-            mapping[safe_col] = "DOUBLE PRECISION"
-        elif pd.api.types.is_bool_dtype(dtype):
-            mapping[safe_col] = "BOOLEAN"
-        elif pd.api.types.is_datetime64_any_dtype(dtype):
-            mapping[safe_col] = "TIMESTAMP"
-        else:
-            mapping[safe_col] = "TEXT"
+        mapping[safe_col] = infer_sql_type(df[col])
     return mapping
 
 

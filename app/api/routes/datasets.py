@@ -47,6 +47,7 @@ from app.services.datasets.schema_context import (
 from app.services.datasets.profiling import profile_dataset, json_safe
 from app.services.datasets.optimizer import analyze_and_optimize
 from app.services.llm.client import llm_client, generate_sql, generate_answer, repair_sql, generate_suggestions
+from app.services.nlq.intent_resolver import resolve_query_intent
 from sqlglot import exp
 
 router = APIRouter()
@@ -195,6 +196,34 @@ def _projection_aliases(sql: str) -> set[str]:
         if isinstance(expr, sqlglot.exp.Alias):
             aliases.add(expr.alias.lower())
     return aliases
+
+
+def _cast_numeric_aggregates_on_text(sql: str, col_types: dict[str, str]) -> str:
+    """
+    If SUM/AVG/MIN/MAX is applied to TEXT columns, cast to DOUBLE PRECISION to avoid SQL errors.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        return sql
+
+    def needs_cast(col_name: str) -> bool:
+        t = col_types.get(col_name.lower(), "").lower()
+        return "text" in t or "character" in t or "varchar" in t
+
+    changed = False
+
+    for agg in parsed.find_all(exp.Func):
+        if agg.name.upper() in {"SUM", "AVG", "MIN", "MAX"} and len(agg.expressions) == 1:
+            arg = agg.expressions[0]
+            if isinstance(arg, exp.Column):
+                col_name = arg.name
+                if needs_cast(col_name):
+                    casted = exp.Cast(this=arg.copy(), to=exp.DataType.build("DOUBLE PRECISION"))
+                    agg.set("expressions", [casted])
+                    changed = True
+
+    return parsed.sql(dialect="postgres") if changed else sql
 
 
 def _make_string_filters_case_insensitive(sql: str, col_types: dict[str, str]) -> str:
@@ -829,6 +858,13 @@ async def query_dataset(
     relationships = meta.get("relationships", [])
     tables = meta.get("tables") or tables
     schema_ctx_str = await build_multi_table_context(session, ds.id, tables)
+    # Append explicit column types for the prompt
+    schema_lines = []
+    for tbl, cols in table_columns.items():
+        schema_lines.append(f"Table {tbl}:")
+        for col in cols:
+            schema_lines.append(f"  - {col['name']} ({col['type']})")
+    schema_ctx_str = "\n".join([schema_ctx_str, "\nColumn types:\n", *schema_lines])
     relationship_lines = []
     if relationships:
         relationship_lines.append("Relationships (joins allowed only on these):")
@@ -841,6 +877,7 @@ async def query_dataset(
     max_attempts = 2
     validation_error = None
     allowed_pairs = {frozenset({rel.get("from", "").lower(), rel.get("to", "").lower()}) for rel in relationships if rel.get("from") and rel.get("to")}
+    intent = resolve_query_intent(body.question) if body.question else {}
 
     while attempts < max_attempts:
         if not sql_text and body.question:
@@ -851,7 +888,8 @@ async def query_dataset(
                     f"Use ONLY the tables {', '.join(sorted(allowed_tables))} with their columns. "
                     "Do NOT use other tables. Joins are only allowed when a relationship exists."
                 )
-            sql_text = await generate_sql(schema_context=schema_ctx_str, question=body.question + extra_hint)
+            intent_hint = f"\nIntent: {intent}" if intent else ""
+            sql_text = await generate_sql(schema_context=schema_ctx_str, question=body.question + extra_hint + intent_hint)
         sql_text = sql_text.replace("`sql", "").replace("`", "").strip()
         validation_error = _validate_sql_against_schema(sql_text, allowed_tables, table_columns, allowed_pairs)
         if not validation_error:
@@ -860,16 +898,18 @@ async def query_dataset(
         sql_text = ""
 
     if validation_error:
+        logger.error("SQL rejected by validator: %s (%s)", sql_text, validation_error)
         raise HTTPException(status_code=400, detail=f"Invalid SQL: {validation_error}")
 
     if not is_safe_sql(sql_text):
-        print(f"Rejected unsafe SQL: {sql_text}")
+        logger.error("Rejected unsafe SQL: %s", sql_text)
         raise HTTPException(status_code=400, detail=f"Unsafe SQL: {sql_text}")
 
     # validate columns against live schema
     cols_in_sql = extract_columns(sql_text)
     select_aliases = _projection_aliases(sql_text)
     tables_in_sql = _extract_tables(sql_text)
+    valid_columns_with_aliases = allowed_cols | select_aliases
     # reject tables not in schema
     for t in tables_in_sql:
         if t not in allowed_tables:
@@ -881,7 +921,7 @@ async def query_dataset(
             continue
         if normalized in select_aliases:
             continue  # allow ORDER BY aliases, etc.
-        if normalized not in allowed_cols:
+        if normalized not in valid_columns_with_aliases:
             raise HTTPException(status_code=400, detail=f"Invalid column referenced: {normalized} | SQL: {sql_text}")
     print(f"LLM question: {body.question}")
     print(f"Generated SQL: {sql_text}")
@@ -889,6 +929,7 @@ async def query_dataset(
     try:
         sql = ensure_limit(sql_text, limit=100).replace("{{table}}", f'"{ds.table_name}"')
         sql = _make_string_filters_case_insensitive(sql, col_types)
+        sql = _cast_numeric_aggregates_on_text(sql, col_types)
         # if joins exist but all columns are from main table, strip joins by using only main table
         tables = _extract_tables(sql_text)
         if len(tables) > 1:
@@ -908,15 +949,18 @@ async def query_dataset(
                 sql = ensure_limit(sql.sql(dialect="postgres"), limit=100)
                 sql = _make_string_filters_case_insensitive(sql, col_types)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"{exc} | SQL: {sql_text}")
+        logger.exception("SQL preparation failed for SQL: %s", sql_text)
+        raise HTTPException(status_code=400, detail=f"Query failed during preparation: {exc}")
     stmt = text(sql)
 
     try:
         result = await session.execute(stmt, intent_params or {})
     except Exception as exc:
+        logger.exception("SQL execution failed for SQL: %s", sql)
+        await session.rollback()
         repaired = await repair_sql(sql, str(exc))
         if not repaired:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=f"Query failed: {exc}")
         try:
             if not is_safe_sql(repaired):
                 raise HTTPException(status_code=400, detail="Repaired SQL considered unsafe")
@@ -925,15 +969,18 @@ async def query_dataset(
                 normalized = normalize_column(col)
                 if normalized == "*" or not normalized:
                     continue
-                if normalized not in allowed_cols:
+                if normalized not in (allowed_cols | select_aliases):
                     raise HTTPException(
                         status_code=400, detail=f"Invalid column referenced after repair: {normalized} | SQL: {repaired}"
                     )
             sql = ensure_limit(repaired, limit=100).replace("{{table}}", f'"{ds.table_name}"')
+            sql = _cast_numeric_aggregates_on_text(sql, col_types)
             stmt = text(sql)
+            logger.info("Executing repaired SQL: %s", sql)
             result = await session.execute(stmt)
         except Exception as exc2:
-            raise HTTPException(status_code=400, detail=f"SQL failed after repair: {exc2}")
+            logger.exception("SQL execution failed after repair for SQL: %s", repaired)
+            raise HTTPException(status_code=400, detail=f"Query failed after repair: {exc2}")
 
     if result.returns_rows:
         columns = _build_column_metadata(result)
