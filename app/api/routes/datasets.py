@@ -44,7 +44,7 @@ from app.services.datasets.schema_context import (
     build_single_table_context,
     build_multi_table_context,
 )
-from app.services.datasets.profiling import profile_dataset
+from app.services.datasets.profiling import profile_dataset, json_safe
 from app.services.datasets.optimizer import analyze_and_optimize
 from app.services.llm.client import llm_client, generate_sql, generate_answer, repair_sql, generate_suggestions
 from sqlglot import exp
@@ -87,7 +87,7 @@ def _profile_df_columns(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
         stats[col] = {
             "distinct_count": int(non_null.nunique()),
             "null_count": int(series.isna().sum()),
-            "sample_values": [v if pd.notna(v) else None for v in non_null.head(5).tolist()],
+            "sample_values": [json_safe(v if pd.notna(v) else None) for v in non_null.head(5).tolist()],
         }
     return stats
 
@@ -456,56 +456,67 @@ async def upload_dataset(
     table_dfs: dict[str, pd.DataFrame] = {}
     columns_records: list[DatasetColumn] = []
 
-    for idx, (sheet, df) in enumerate(merged_sheets):
-        # normalize + create table + insert
-        table_name = dynamic_tables.build_table_name(str(dataset.id), idx if idx > 0 else None)
-        await dynamic_tables.create_table_from_df(session, str(dataset.id), df, table_name=table_name)
-        if idx == 0:
-            dataset.table_name = table_name
-        # profile columns
-        df_norm, mapping = dynamic_tables.normalize_columns(df)
-        inferred_types = dynamic_tables.infer_types(df_norm)
-        col_profiles = _profile_df_columns(df_norm)
-        for order, orig in enumerate(df.columns):
-            db_col = mapping[orig]
-            db_type = inferred_types[db_col]
-            profile = col_profiles.get(db_col) or col_profiles.get(orig) or {}
-            profile["table"] = table_name
-            columns_records.append(
-                DatasetColumn(
-                    dataset_id=dataset.id,
-                    original_name=orig,
-                    name=db_col,
-                    db_type=db_type,
-                    order=order,
-                    is_nullable=True,
-                    sample_values=profile,
+    try:
+        for idx, (sheet, df) in enumerate(merged_sheets):
+            # normalize + create table + insert
+            table_name = dynamic_tables.build_table_name(str(dataset.id), idx if idx > 0 else None)
+            await dynamic_tables.create_table_from_df(session, str(dataset.id), df, table_name=table_name)
+            if idx == 0:
+                dataset.table_name = table_name
+            # profile columns
+            df_norm, mapping = dynamic_tables.normalize_columns(df)
+            inferred_types = dynamic_tables.infer_types(df_norm)
+            col_profiles = _profile_df_columns(df_norm)
+            for order, orig in enumerate(df.columns):
+                db_col = mapping.get(orig)
+                if db_col is None:
+                    logger.warning("Column %s not found in mapping, skipping", orig)
+                    continue
+                db_type = inferred_types.get(db_col) or inferred_types.get(orig)
+                profile = col_profiles.get(db_col) or col_profiles.get(orig) or {}
+                profile = json_safe(profile)
+                profile["table"] = table_name
+                columns_records.append(
+                    DatasetColumn(
+                        dataset_id=dataset.id,
+                        original_name=orig,
+                        name=db_col,
+                        db_type=db_type,
+                        order=order,
+                        is_nullable=True,
+                        sample_values=profile,
+                    )
                 )
-            )
-        table_dfs[table_name] = df_norm
+            table_dfs[table_name] = df_norm
 
-    dataset.status = "ready"
+        dataset.status = "ready"
 
-    session.add_all(columns_records)
-    await session.flush()
+        session.add_all(columns_records)
+        await session.flush()
 
-    # Profile first table for backwards compatibility
-    await profile_dataset(session, dataset.id, dataset.table_name)
-    relationships = _detect_relationships(table_dfs)
-    meta = {
-        "tables": list(table_dfs.keys()),
-        "relationships": relationships,
-        "metrics": [],
-        "dimensions": [],
-        "time_columns": [],
-        "synonyms": {},
-    }
-    _metadata_cache[str(dataset.id)] = meta
+        await session.commit()
 
-    await session.commit()
+        # Profile first table for backwards compatibility
+        await profile_dataset(session, dataset.id, dataset.table_name)
+        relationships = _detect_relationships(table_dfs)
+        meta = {
+            "tables": list(table_dfs.keys()),
+            "relationships": relationships,
+            "metrics": [],
+            "dimensions": [],
+            "time_columns": [],
+            "synonyms": {},
+        }
+        _metadata_cache[str(dataset.id)] = meta
 
-    await log_action(session, dataset.id, current_user.id, "upload", {"rows": dataset.row_count})
-    return UploadResponse(dataset_id=str(dataset.id), rows=dataset.row_count)
+        await log_action(session, dataset.id, current_user.id, "upload", {"rows": dataset.row_count})
+        return UploadResponse(dataset_id=str(dataset.id), rows=dataset.row_count)
+    except Exception as exc:
+        logger.exception("Failed to process spreadsheet upload", exc_info=exc)
+        await session.rollback()
+        raise HTTPException(
+            status_code=400, detail="Failed to process spreadsheet. Please verify the file format and headers."
+        ) from exc
 
 
 @router.post("/dev-seed", response_model=UploadResponse)
@@ -559,8 +570,11 @@ async def dev_seed_dataset(
     inferred_types = dynamic_tables.infer_types(df_norm)
     cols = []
     for idx, orig in enumerate(df.columns):
-        db_col = mapping[orig]
-        db_type = inferred_types[db_col]
+        db_col = mapping.get(orig)
+        if db_col is None:
+            logger.warning("Column %s not found in mapping, skipping", orig)
+            continue
+        db_type = inferred_types.get(db_col) or inferred_types.get(orig)
         cols.append(
             DatasetColumn(
                 dataset_id=dataset.id,
@@ -574,6 +588,7 @@ async def dev_seed_dataset(
         )
     session.add_all(cols)
     await session.flush()
+    await session.commit()
 
     await profile_dataset(session, dataset.id, table_name)
     meta = await analyze_and_optimize(session, dataset.id, table_name)
