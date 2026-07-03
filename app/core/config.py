@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     # ---- Core Settings ----
     database_url: str | None = Field(None, alias="DATABASE_URL")
     firebase_project_id: str | None = Field(None, alias="FIREBASE_PROJECT_ID")
+    firebase_credentials_json: str | None = Field(None, alias="FIREBASE_CREDENTIALS_JSON")
+    firebase_credentials_path: str | None = Field(None, alias="FIREBASE_CREDENTIALS_PATH")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
 
     # ---- Development Mode ----

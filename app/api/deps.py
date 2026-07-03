@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException
+from fastapi import Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
@@ -25,13 +25,26 @@ async def _ensure_dev_user(session: AsyncSession) -> User:
     return dev_user
 
 
-async def get_current_user(session: AsyncSession = Depends(get_session)) -> CurrentUser:
-    if settings.dev_mode:
+def _extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    return token.strip()
+
+
+async def get_current_user(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    session: AsyncSession = Depends(get_session),
+) -> CurrentUser:
+    token = _extract_bearer_token(authorization)
+
+    if settings.dev_mode and not token:
         user = await _ensure_dev_user(session)
         return CurrentUser(id=str(user.id), firebase_uid=user.firebase_uid, email=user.email)
 
-    # Future: Firebase path (kept for compatibility)
-    token_claims = await verify_token("")  # placeholder; real header parsing when re-enabled
+    token_claims = await verify_token(token or "")
     stmt = select(User).where(User.firebase_uid == token_claims["uid"])
     result = await session.execute(stmt)
     user = result.scalar_one_or_none()
